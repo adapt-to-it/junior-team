@@ -1,0 +1,11 @@
+{
+  "name": "junior-team",
+  "owner": { "name": "adapt-to-it" },
+  "plugins": [
+    {
+      "name": "junior-team",
+      "source": "./",
+      "description": "Contract-based delegation: the lead model writes short contracts, low-cost junior agents write the code inside enforced file scopes."
+    }
+  ]
+}
