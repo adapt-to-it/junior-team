@@ -83,6 +83,7 @@ declare module 'claude-code' {
       architect: { code: number; bash: number; solo: number; noticed: number }
       // Per unit, whether the last test run or verify passed: it unlocks the units that follow it.
       passed: Record<string, boolean>
+      proven: Record<string, string>
       // The context tokens of the main thread's last response.
       context: number
       root: string

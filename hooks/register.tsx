@@ -83,6 +83,8 @@ const written = atom({ plugin: 'junior-team', key: 'written' } as const, {})
 const architect = atom({ plugin: 'junior-team', key: 'architect' } as const, { code: 0, bash: 0, solo: 0, noticed: 0 })
 const context = atom({ plugin: 'junior-team', key: 'context' } as const, 0)
 const passed = atom({ plugin: 'junior-team', key: 'passed' } as const, {})
+// For each unit, the fingerprint of its files when its test last passed: verify does not rerun an unchanged unit.
+const proven = atom({ plugin: 'junior-team', key: 'proven' } as const, {} as Record<string, string>)
 // The work root when the units are outside the session folder, for example in a worktree.
 const workRoot = atom({ plugin: 'junior-team', key: 'root' } as const, '')
 // The worktrees of the isolated units, by unit id.
@@ -276,6 +278,26 @@ const run = async ($: Engine, label: string, argv: readonly string[], unit?: Uni
 
 type Ran = { exitCode: number; stdout: string; stderr: string }
 
+// A checksum of the unit's files: content, not modification time, so a save without changes does not count.
+const FINGERPRINT = 'find "$@" -type f -print0 2>/dev/null | LC_ALL=C sort -z | xargs -0 cksum 2>/dev/null | cksum'
+
+const fingerprint = async ($: Engine, paths: readonly string[]): Promise<string | undefined> => {
+  const ran = await $.process
+    .run(['sh', '-c', FINGERPRINT, 'junior-team', ...paths], { timeoutMs: LOOKUP_TIMEOUT_MS })
+    .catch(() => undefined)
+
+  return ran?.exitCode === 0 ? ran.stdout.trim() : undefined
+}
+
+// Records or clears the proof that the unit's test passed on these files.
+const prove = async ($: Engine, unit: Unit, ok: boolean): Promise<void> => {
+  const print = ok ? await fingerprint($, unit.paths) : undefined
+  await update($, proven, all => {
+    const rest = Object.fromEntries(Object.entries(all ?? {}).filter(([id]) => id !== unit.id))
+    return print === undefined ? rest : { ...rest, [unit.id]: print }
+  })
+}
+
 // `codegraph` runs as a process: indexing and resolving a reference costs no model turns.
 const codegraph = async ($: Engine, args: readonly string[], timeoutMs: number): Promise<Ran> => {
   const cwd = await projectRoot($)
@@ -293,25 +315,58 @@ const codegraph = async ($: Engine, args: readonly string[], timeoutMs: number):
   return second ?? { exitCode: -1, stdout: '', stderr: 'codegraph is not installed or not on PATH.' }
 }
 
-// Prepares the project index: creates it if missing, otherwise aligns it with the files. Returns the state to show.
+const BUILDING = 'being built in the background'
+
+// The first index of a folder takes minutes on a large project: it builds in a detached process and nobody waits for it.
+const BUILD = `
+bin=$(command -v codegraph || echo "$HOME/.local/bin/codegraph")
+nohup "$bin" init -y "$1" >/dev/null 2>&1 </dev/null &
+echo $!
+`
+
+const isAlive = async ($: Engine, pid: string): Promise<boolean> =>
+  (await $.process.run(['kill', '-0', pid], { timeoutMs: LOOKUP_TIMEOUT_MS }).catch(() => ({ exitCode: 1 }))).exitCode === 0
+
+// Prepares the project index: starts it in the background if missing, otherwise aligns it with the files. Returns the state to show.
 const prepareIndex = async ($: Engine): Promise<string> => {
   const root = await projectRoot($)
+  const known = await read($, index)
+  const pid = known.startsWith(BUILDING) ? /pid (\d+)/.exec(known)?.[1] : undefined
+  if (pid !== undefined && (await isAlive($, pid))) return known
   const status = await codegraph($, ['status', '-j', root], LOOKUP_TIMEOUT_MS)
-  const fresh = !isInitialized(status.stdout)
-  const built = await codegraph($, fresh ? ['init', '-y', root] : ['sync', '-q', root], INDEX_TIMEOUT_MS)
-  const state =
-    built.exitCode === 0
-      ? `${INDEX_READY}${fresh ? ' (created now in .codegraph)' : ''}`
-      : `not available: ${tail(`${built.stdout}\n${built.stderr}`.trim())}`
+  let state: string
+  if (!isInitialized(status.stdout)) {
+    const started = await $.process
+      .run(['sh', '-c', BUILD, 'junior-team', root], { timeoutMs: LOOKUP_TIMEOUT_MS, cwd: root })
+      .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+    const child = started.stdout.trim()
+    state = started.exitCode === 0 && /^\d+$/.test(child)
+      ? `${BUILDING} (pid ${child})`
+      : `not available: ${tail(`${started.stdout}\n${started.stderr}`.trim())}`
+  } else {
+    const built = await codegraph($, ['sync', '-q', root], INDEX_TIMEOUT_MS)
+    state =
+      built.exitCode === 0
+        ? `${INDEX_READY}${pid !== undefined ? ' (created in .codegraph)' : ''}`
+        : `not available: ${tail(`${built.stdout}\n${built.stderr}`.trim())}`
+  }
   await update($, index, () => state)
   await update($, cache, () => ({}))
 
   return state
 }
 
+// The index state, checked again while a background build is running.
+const indexState = async ($: Engine): Promise<string> => {
+  const known = await read($, index)
+
+  return known === '' || known.startsWith(BUILDING) ? prepareIndex($) : known
+}
+
 // Resolves a reference for an agent. Text already served to that agent is not returned a second time.
 const resolve = async ($: Engine, agentId: string, text: string, withBody: boolean): Promise<string> => {
   const root = await projectRoot($)
+  if (!(await indexState($)).startsWith(INDEX_READY)) return `${text}: the index is not ready. Use Read.`
   const ref = parseRef(text, root)
   if (typeof ref === 'string') return ref
   const id = `${ref.file ?? ''}#${ref.symbol ?? ''}${withBody ? '+body' : ''}`
@@ -586,6 +641,7 @@ export const register: Register = on => {
       const own = (await read($, isolates))[unit.id]
       if (own !== undefined) await syncWorktree($, root, own, unit.paths)
       await mark($, unit.id, true)
+      await prove($, unit, true)
     }
 
     return {
@@ -602,8 +658,7 @@ export const register: Register = on => {
     const keys = parseKeys(e.keys)
     if (typeof keys === 'string') return { deny: keys }
     // The lead looks up the index even before the plan, to decide the boundaries.
-    const known = await read($, index)
-    const state = known === '' ? await prepareIndex($) : known
+    const state = await indexState($)
     if (!state.startsWith(INDEX_READY)) return { result: `Index ${state}. Use Read.` }
 
     const caller = e.agentId ?? MAIN
@@ -720,9 +775,25 @@ export const register: Register = on => {
 
     if (e.action === 'verify') {
       const lines: string[] = []
-      for (const unit of plan.units) {
-        if (only !== undefined && unit.id !== only) continue
-        const line = unit.test ? await run($, unit.id, unit.test) : `no test · ${unit.id}`
+      const chosen = plan.units.filter(unit => only === undefined || unit.id === only)
+      const proofs = await read($, proven)
+      // A unit whose test passed and whose files have not changed since is not rerun: the checks cover the integration.
+      // Without checks, or with verify on a single unit, every test runs.
+      const canSkip = only === undefined && plan.checks.length > 0
+      const outcome = async (unit: Unit): Promise<string> => {
+        if (unit.test === undefined) return `no test · ${unit.id}`
+        const proof = proofs[unit.id]
+        if (canSkip && proof !== undefined && proof === (await fingerprint($, unit.paths))) {
+          return `ok · ${unit.id} · test passed earlier, files unchanged: not rerun`
+        }
+        const line = await run($, unit.id, unit.test, unit)
+        await prove($, unit, line.startsWith('ok'))
+        return line
+      }
+      // Light tests start together; the others take the queue one at a time.
+      const early = new Map(chosen.filter(unit => unit.light === true).map(unit => [unit.id, outcome(unit)]))
+      for (const unit of chosen) {
+        const line = (await early.get(unit.id)) ?? (await outcome(unit))
         lines.push(line)
         if (unit.test !== undefined) await mark($, unit.id, line.startsWith('ok'))
         const cause = line.startsWith('FAILED') ? blame(line, await projectRoot($), plan.units) : undefined

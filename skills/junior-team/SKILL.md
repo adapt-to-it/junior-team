@@ -127,9 +127,9 @@ Estimate `lines` honestly: `status` compares it with the code actually written.
 
 `plan` opens the "Team" panel in the user's interface, in the terminal and in the desktop app. The panel shows units, waves, juniors at work, tests and leverage, and updates itself. A banner above the prompt summarizes the juniors at work and the context warning. The user reopens it with `/team-panel`.
 
-Between launches, do not rewrite the state of the units in chat: the user sees it in the panel, and every line you write costs output tokens. In chat, write only decisions, failures, and the final report.
+Between launches, do not rewrite the state of the units in chat: the user sees it in the panel, and every line you write costs output tokens. In chat, write only decisions and failures.
 
-`plan` prepares the `codegraph` index of the project: it creates it if missing (`.codegraph` folder, ignored by git), otherwise it brings it up to date. The first time on a large project it takes a few minutes.
+`plan` prepares the `codegraph` index of the project: it creates it if missing (`.codegraph` folder, ignored by git), otherwise it brings it up to date. The first index of a folder builds in the background: `plan` does not wait, and until it is ready `lookup` answers that the index is being built, so read with Read.
 
 Call order: `plan`, then `note`, then the launch.
 
@@ -155,9 +155,9 @@ If the plugin rejects a contract because it exceeds the cap, shorten it. Do not 
 
 While juniors are at work, do not run tests with Bash, not even in the background: the juniors' test runs go through a queue and your commands do not, and on a shared database or container the former slow the latter down until they time out. Run the suites with `verify`, which goes through the queue, or wait until the juniors have handed back.
 
-Call `action: "verify"` at the end of every wave, before integrating, even when the juniors report a passing test. It runs the unit tests and the `checks` without model turns. Do not run the same tests yourself with Bash: the `checks` run only through `verify`.
+Call `action: "verify"` at the end of every wave, before integrating, even when the juniors report a passing test. It runs the unit tests and the `checks` without model turns. A unit whose test already passed and whose files have not changed since is not rerun, when the plan has `checks`; `light` tests run in parallel. Do not run the same tests yourself with Bash: the `checks` run only through `verify`.
 
-- All `ok`: go to the report. Do not reread the juniors' code.
+- All `ok`: close. Do not reread the juniors' code.
 - You must integrate the units, or a `check` fails on a boundary between units: call `action: "outline"`. It returns the classes, methods and constants that the juniors wrote, with line and, where the language exposes it, signature. For the signature or body of a method, call `lookup` with `path#method`; `body: true` adds the body.
 - A unit fails: first check whether the defect is in the contract. Then send the fix to its junior with SendMessage: it resumes with the context it already has, and its tests restart from zero. If the junior no longer responds, relaunch it with the contract and the tail of the failed output.
 - Do not fix a junior's code yourself. Each of your corrections rereads your context, which costs dozens of times more than the junior's. The one exception is a single line, after the junior has exhausted its test runs.
@@ -177,22 +177,8 @@ Launch `junior-team:reviewer` only in two cases:
 
 The reviewer receives the user's request, the contract, the result of `verify`, and the command that produces the diff, limited to the units' files. It does not receive the juniors' reports. One reviewer per task. It has 16 turns and does not run tests.
 
-## 10. Report
+## 10. Closing
 
-Call `action: "status"` and report:
-
-```
-Plan: <n> units, models used
-Verifications: <result per unit and per check>
-Leverage: <code/contract ratio from status>
-Board: <notes, lookups, keys not found>
-Tokens: <total line from status>
-Relaunches: <status line>
-Open concerns: <list, or "none">
-```
-
-If the leverage is below 4, say so: that task cost less without the team.
-
-A key not found indicates a wrong reference or missing context: fix the note before relaunching.
+Do not paste `status` or a report into the chat: the user sees units, tests and leverage in the panel. Close with one or two lines: what changed and any open concern. If a key was not found on the board, fix the note before a relaunch.
 
 No automatic commits.

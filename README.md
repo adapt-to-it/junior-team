@@ -8,7 +8,7 @@ A Claude Code plugin that splits a code change into units under contract and han
 - Each junior writes only the files of its unit and checks them with the `test` tool.
 - Shared context lives on a board of notes that point to symbols in a project index, not in the contract.
 - `verify` runs the unit tests and the project-wide checks without model turns.
-- The architect integrates the results from an outline and reports the leverage: code written by juniors versus tokens spent by the architect.
+- The architect integrates the results from an outline. The panel shows the leverage: code written by juniors versus what the architect wrote.
 
 Small tasks, and scattered edits across many files, stay with the architect: there the contract would cost as much as the code.
 
@@ -47,7 +47,7 @@ The architect declares the plan with `action: "plan"` on the `team` tool:
 2. `note`: add board notes that point to symbols (`refs`) or record single decisions (`text`).
 3. Launch: one `junior-team:junior` per unit, all in one message, with the contract as the prompt. When units declare `after`, launch only the first wave.
 4. `verify`: at the end of each wave, runs the tests and the checks. Failed units go back to their junior.
-5. `outline` and `lookup` to integrate and inspect the boundaries; `status` for the final report.
+5. `outline` and `lookup` to integrate and inspect the boundaries; `status` for tokens and leverage on demand.
 
 The `/team-panel` command reopens the progress panel. Nothing is committed automatically.
 

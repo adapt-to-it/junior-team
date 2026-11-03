@@ -26,8 +26,10 @@ const NODE = [
 ].join('\n')
 
 // `codegraph` answers like a never-indexed project that knows a single symbol.
+// The background build in the tests finishes at once: the next status finds the index.
+let built = false
 const indexer = (args: readonly string[]): string => {
-  if (args[0] === 'status') return '{"initialized":false}'
+  if (args[0] === 'status') return `{"initialized":${built}}`
   if (args[0] !== 'node') return ''
   if (args.includes('--symbols-only')) {
     return [
@@ -46,8 +48,9 @@ const indexer = (args: readonly string[]): string => {
 const world = (on: On) => {
   const seen = {
     models: [] as string[], indexed: [] as string[][], running: [] as string[], cwds: [] as (string | undefined)[], outputs: [] as string[],
-    scripts: [] as string[][], testCwds: [] as (string | undefined)[],
+    scripts: [] as string[][], testCwds: [] as (string | undefined)[], writes: 0, nodeRuns: 0,
   }
+  built = false
   on('session.root', () => ({ value: '/progetto' }))
   on('agent.list', () => ({
     value: seen.running.map(id => ({ id, description: 'unit', type: 'junior-team:junior', status: 'running' as const })),
@@ -61,9 +64,20 @@ const world = (on: On) => {
   on('process.run', ($, e) => {
     if (e.argv[0] === 'sh') {
       seen.scripts.push(e.argv.slice(4))
-      const out = String(e.argv[2]).includes('git-common-dir') ? '/progetto/.git\n' : ''
+      const script = String(e.argv[2])
+      if (script.includes('init -y')) {
+        built = true
+        seen.indexed.push(['init', '-y', String(e.argv[4])])
+        return { value: { exitCode: 0, stdout: '4242\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (script.includes('cksum')) {
+        return { value: { exitCode: 0, stdout: `sum ${seen.writes}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      const out = script.includes('git-common-dir') ? '/progetto/.git\n' : ''
       return { value: { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
+    if (e.argv[0] === 'node') seen.nodeRuns += 1
+    if (e.argv[0] === 'kill') return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[0] === 'php') seen.testCwds.push(e.init?.cwd)
     const isIndexer = e.argv[0] === 'codegraph'
     if (isIndexer) seen.indexed.push(e.argv.slice(1))
@@ -234,14 +248,15 @@ const LOOKUP = 'mcp__junior-team__lookup'
 test('the plan creates the index when missing and aligns it after verify', async ($, on) => {
   const seen = world(on)
   const planned = await $.tool.call({ tool: TOOL, action: 'plan', units: UNITS })
-  expect(planned.result).toContain('index · ready (created now in .codegraph)')
+  expect(planned.result).toContain('index · being built in the background (pid 4242)')
   expect(seen.indexed).toEqual([
     ['status', '-j', '/progetto'],
     ['init', '-y', '/progetto'],
   ])
 
   await $.tool.call({ tool: TOOL, action: 'verify' })
-  expect(seen.indexed.at(-1)).toEqual(['init', '-y', '/progetto'])
+  expect(seen.indexed.at(-1)).toEqual(['sync', '-q', '/progetto'])
+  expect(String((await $.tool.call({ tool: TOOL, action: 'status' })).result)).toContain('index')
 })
 
 test('the board accepts pointers and rejects prose', async ($, on) => {
@@ -267,6 +282,8 @@ test('a junior reads its notes, in slices, and only once', async ($, on) => {
     ],
   })
   await $.agent.spawn(junior('UNIT: lexer\nsee @plan'))
+  await $.tool.call({ tool: TOOL, action: 'status' })
+  await $.tool.call({ tool: TOOL, action: 'outline' })
   seen.indexed.length = 0
 
   const first = await $.tool.call({ tool: LOOKUP, agentId: 'agente-1', keys: ['@plan', 'secret', '../outside.ts'] })
@@ -324,9 +341,11 @@ test("a reference stays inside the project and does not become an option", () =>
 
 test('lookup prepares the index even without a plan', async ($, on) => {
   const seen = world(on)
+  const first = await $.tool.call({ tool: LOOKUP, keys: ['src/core/plan.ts'] })
+  expect(first.result).toContain('being built in the background')
+  expect(seen.indexed[1]).toEqual(['init', '-y', '/progetto'])
   const map = await $.tool.call({ tool: LOOKUP, keys: ['src/core/plan.ts'] })
   expect(map.result).toContain('1 symbols')
-  expect(seen.indexed[1]).toEqual(['init', '-y', '/progetto'])
 })
 
 const TRIAL = 'mcp__junior-team__test'
@@ -414,7 +433,7 @@ test("the outline shows the interface of the files written by each unit", async 
     '## lexer\n**src/lexer/Lexer.php**\n- `Lexer` (class) — :10\n- `read` (method) (text: string): Token[] — :14\n\n' +
       'core: no file written with Edit or Write.',
   )
-  expect(seen.indexed.map(args => args[0])).toEqual(['status', 'init', 'node'])
+  expect(seen.indexed.map(args => args[0])).toEqual(['status', 'sync', 'node'])
   const one = await $.tool.call({ tool: TOOL, action: 'outline', unit: 'core' })
   expect(one.result).toBe('core: no file written with Edit or Write.')
 })
@@ -562,7 +581,7 @@ test('tests run one at a time even when two juniors test together', async ($, on
   on('agent.list', () => ({ value: [] }))
   on('agent.spawn', ($, e) => ({ model: e.model ?? '', agentId: e.prompt.includes('lexer') ? 'a1' : 'a2' }))
   on('process.run', async ($, e) => {
-    if (e.argv[0] === 'codegraph' || e.argv[0] === 'sleep') {
+    if (['codegraph', 'sleep', 'sh', 'kill'].includes(e.argv[0] ?? '')) {
       if (e.argv[0] === 'sleep') await new Promise(done => setTimeout(done, 5))
       return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
@@ -671,7 +690,7 @@ test('a test broken by code halfway through another junior waits for it to finis
   on('agent.spawn', ($, e) => ({ model: e.model ?? '', agentId: e.prompt.includes('core') ? 'a1' : 'a2' }))
   on('process.run', ($, e) => {
     const done = { stdout: '', isStdoutTruncated: false, isStderrTruncated: false }
-    if (e.argv[0] === 'codegraph') return { value: { ...done, exitCode: 0, stderr: '' } }
+    if (['codegraph', 'sh', 'kill'].includes(e.argv[0] ?? '')) return { value: { ...done, exitCode: 0, stderr: '' } }
     // The wait goes through a sleep process: the engine does not count its time in the hook's budget.
     if (e.argv[0] === 'sleep') {
       slept += 1
@@ -958,4 +977,26 @@ test('light requires a test and isolated is boolean', async ($, on) => {
   expect(light.deny).toContain('light without a test')
   const bad = await $.tool.call({ tool: TOOL, action: 'plan', units: [{ id: 'x', paths: ['src/x'], lines: 100, isolated: 'yes' }] })
   expect(bad.deny).toContain('booleans')
+})
+
+test('verify does not rerun a unit whose test passed and whose files are unchanged', async ($, on) => {
+  const seen = world(on)
+  const units = [{ id: 'lexer', paths: ['src/lexer'], lines: 100, test: ['node', 'src/lexer/test.js'] }, UNITS[1]]
+  await $.tool.call({ tool: TOOL, action: 'plan', units, checks: [['make', 'check']] })
+  await $.agent.spawn(junior('UNIT: lexer'))
+  expect(String((await $.tool.call({ tool: TRIAL, agentId: 'agente-1' })).result)).toStartWith('ok')
+  expect(seen.nodeRuns).toBe(1)
+
+  const same = String((await $.tool.call({ tool: TOOL, action: 'verify' })).result)
+  expect(same).toContain('ok · lexer · test passed earlier, files unchanged: not rerun')
+  expect(seen.nodeRuns).toBe(1)
+
+  seen.writes = 1
+  const changed = String((await $.tool.call({ tool: TOOL, action: 'verify' })).result)
+  expect(changed).not.toContain('not rerun')
+  expect(seen.nodeRuns).toBe(2)
+
+  const single = String((await $.tool.call({ tool: TOOL, action: 'verify', unit: 'lexer' })).result)
+  expect(single).not.toContain('not rerun')
+  expect(seen.nodeRuns).toBe(3)
 })
