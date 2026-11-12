@@ -46,6 +46,20 @@ const LOOKUP_TIMEOUT_MS = 30_000
 const INDEX_READY = 'ready'
 // Safety net against Bash loops: the measured median is 7 turns.
 const JUNIOR_TURNS_MAX = 30
+// Haiku 5.5's default effort, pinned so a change of defaults does not change the juniors.
+// The `juniorEffort` option overrides it, for A/B runs on thinking tokens.
+const JUNIOR_EFFORT = 'medium'
+const JUNIOR_EFFORTS: readonly string[] = ['low', 'medium', 'high']
+// Sonnet 5.5's recommended starting effort for agentic work.
+const REVIEWER_EFFORT = 'medium'
+// Haiku 5.5 is priced in two tiers: a prompt over 100K tokens costs 5 times as much per token.
+// The junior compacts at this window instead of running its reads into the upper tier.
+const JUNIOR_COMPACT_WINDOW = 100_000
+// Compaction acts only between model steps, so the reads of one step land on top of whatever context the junior has.
+// With that window the effective compaction point measured live is 80K tokens: the reads of a step may add
+// at most 100K - 80K = 20K tokens. A Read result measured on real runs is about 2.2 characters per token:
+// 20K x 2.2 = 44K characters, rounded down for the line numbers Read adds.
+const STEP_READ_CHARS = 40_000
 // Beyond this, the junior reports the failure instead of retrying.
 const TRIALS_MAX = 3
 // Beyond TRIALS_MAX a test run starts only if the last one reduced the failing tests, up to this cap.
@@ -89,6 +103,14 @@ const proven = atom({ plugin: 'junior-team', key: 'proven' } as const, {} as Rec
 const workRoot = atom({ plugin: 'junior-team', key: 'root' } as const, '')
 // The worktrees of the isolated units, by unit id.
 const isolates = atom({ plugin: 'junior-team', key: 'isolates' } as const, {} as Record<string, string>)
+const wholeReads = atom({ plugin: 'junior-team', key: 'wholeReads' } as const, {} as Record<string, Record<string, string>>)
+
+// Records a whole read, or with `print` undefined forgets it: after a write the file is new to the junior.
+const remember = ($: Engine, agentId: string, path: string, print: string | undefined): Promise<unknown> =>
+  update($, wholeReads, all => {
+    const own = Object.fromEntries(Object.entries(all?.[agentId] ?? {}).filter(([file]) => file !== path))
+    return { ...all, [agentId]: print === undefined ? own : { ...own, [path]: print } }
+  })
 
 const projectRoot = async ($: Engine): Promise<string> => (await read($, workRoot)) || $.session.root()
 
@@ -123,6 +145,49 @@ const unowned = (cause: { files: string[]; owners: string[] } | undefined, unit:
   return cause === undefined || files.length === 0 || cause.owners.includes(unit)
     ? ''
     : `The output names files that no unit owns: ${files.join(', ')}. If the cause is there, do not fix it: report it.\n\n`
+}
+
+// The unit's worktree returns to the main folder and disappears. The entry is taken inside the update:
+// of two calls for the same worktree only the first closes it.
+const release = async ($: Engine, unitId: string): Promise<void> => {
+  const unit = (await read($, units)).find(one => one.id === unitId)
+  if (unit === undefined) return
+  let dir: string | undefined
+  await update($, isolates, all => {
+    dir = all?.[unitId]
+    return dir === undefined ? (all ?? {}) : Object.fromEntries(Object.entries(all).filter(([id]) => id !== unitId))
+  })
+  if (dir !== undefined) await closeWorktree($, await projectRoot($), dir, unit.paths)
+}
+
+// A resumed isolated junior still works in its worktree's folder, removed at the end of its last run:
+// the worktree opens again at the same path from the current state, before the run starts.
+// Returns the reason the resume is refused, or undefined.
+const reopen = async ($: Engine, agentId: string): Promise<string | undefined> => {
+  const row = (await read($, agents))[agentId]
+  if (row?.role !== 'junior') return undefined
+  const unit = (await read($, units)).find(one => one.id === row.unit)
+  if (unit?.isolated !== true || (await read($, isolates))[unit.id] !== undefined) return undefined
+  const root = await projectRoot($)
+  const dir = await worktreeDir($, root, unit.id)
+  if (dir === undefined) return `junior-team: ${unit.id} is isolated, but ${root} is not a git repository.`
+  const failed = await openWorktree($, root, dir)
+  if (failed !== undefined) return `junior-team: the worktree of ${unit.id} was not reopened: ${failed}`
+  await update($, isolates, all => ({ ...all, [unit.id]: dir }))
+
+  return undefined
+}
+
+// An isolated junior's worktree closes at the end of its run, with or without hand-back (turn cap, error, interruption).
+// A relaunch of the unit, already running in the same folder, keeps it.
+const closeOnEnd = async ($: Engine, agentId: string): Promise<void> => {
+  const rows = await read($, agents)
+  const row = rows[agentId]
+  if (row?.role !== 'junior') return
+  const relaunched = (await $.agent.list()).some(
+    agent => agent.id !== agentId && agent.status === 'running' && rows[agent.id]?.role === 'junior' && rows[agent.id]?.unit === row.unit,
+  )
+  if (!relaunched) await release($, row.unit)
 }
 
 const mark = ($: Engine, unit: string, ok: boolean): Promise<unknown> =>
@@ -173,6 +238,7 @@ const wrote = async ($: Engine, agentId: string | undefined, text: string, file:
   if (row?.role !== 'junior') return
   const path = normalize(file, await projectRoot($))
   await track($, agentId, known => (known === undefined ? undefined : { ...known, code: known.code + text.length }))
+  await remember($, agentId, path, undefined)
   await update($, written, all => {
     const files = all?.[row.unit] ?? []
 
@@ -240,15 +306,6 @@ const pause = async ($: Engine, ms: number): Promise<void> => {
 // (measured on October 14: tables already existing, duplicate keys).
 let testing = false
 const QUEUE_STEP_MS = 1_000
-// The lead's SendMessage calls to juniors, until the engine raises them as a resume.
-const resumes: { to: string; message: string }[] = []
-
-const takeResume = (prompt: string): string | undefined => {
-  const at = resumes.findIndex(one => prompt.includes(one.message.slice(0, 200).trim()))
-  if (at < 0) return undefined
-
-  return resumes.splice(at, 1)[0]?.to
-}
 
 // Juniors paused while waiting: two juniors that break each other do not wait for each other.
 const paused = new Set<string>()
@@ -440,8 +497,10 @@ const safe = async <R,>(handler: () => Promise<R>): Promise<R | { deny: string }
   }
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
   registerView(on)
+  const chosen = options.juniorEffort
+  const juniorEffort = typeof chosen === 'string' && JUNIOR_EFFORTS.includes(chosen) ? chosen : JUNIOR_EFFORT
 
   on('session.start', async ($, e, next) => {
     await $.agent.register({
@@ -453,7 +512,9 @@ export const register: Register = on => {
       // No Bash: the junior tests its unit with the test tool, which runs only the plan's command.
       tools: ['Read', 'Grep', 'Glob', 'Edit', 'Write', LOOKUP, TRIAL],
       model: 'haiku',
+      effort: juniorEffort,
       maxTurns: JUNIOR_TURNS_MAX,
+      autoCompactWindow: JUNIOR_COMPACT_WINDOW,
       omitClaudeMd: true,
     })
     await $.agent.register({
@@ -463,6 +524,7 @@ export const register: Register = on => {
       prompt: REVIEWER_PROMPT,
       tools: ['Read', 'Grep', 'Glob', 'Bash', LOOKUP],
       model: 'sonnet',
+      effort: REVIEWER_EFFORT,
       maxTurns: REVIEWER_TURNS_MAX,
       omitClaudeMd: true,
     })
@@ -822,6 +884,12 @@ export const register: Register = on => {
   }))
 
   on('agent.spawn', async ($, e, next) => {
+    // A SendMessage to a finished agent resumes it under the same id: the prompt is the message, not a contract,
+    // and the launch checks do not apply. The check comes first, so it does not depend on the resumed run's type.
+    if (e.resume !== undefined) {
+      const why = await reopen($, e.resume.agentId)
+      return why === undefined ? next(e) : { deny: why }
+    }
     if (e.subagentType !== JUNIOR && e.subagentType !== REVIEWER) return next(e)
 
     if (e.subagentType === REVIEWER) {
@@ -833,11 +901,6 @@ export const register: Register = on => {
     }
 
     const id = unitOf(e.prompt)
-    // A SendMessage to a paused junior resumes it: the engine raises it as a launch, with the message in place of the contract.
-    if (id === undefined) {
-      const resumed = takeResume(e.prompt)
-      if (resumed !== undefined) return next(e)
-    }
     const unit = (await read($, units)).find(one => one.id === id)
     if (unit === undefined) {
       return {
@@ -912,8 +975,42 @@ export const register: Register = on => {
     const at = await placed($, e.agentId, e.file_path)
     const go = () => next(at.real === e.file_path ? e : { ...e, file_path: at.real })
     if (e.limit !== undefined) return go()
+    const agentId = e.agentId
+    const path = normalize(at.view, await projectRoot($))
+    // A whole read of a file already in the context, unchanged on disk, adds the same text again: it is refused.
+    // The key is the project path, the fingerprint is taken on the file the junior really reads.
+    const print = e.offset === undefined ? await fingerprint($, [at.real]) : undefined
+    if (print !== undefined && (await read($, wholeReads))[agentId]?.[path] === print) {
+      return { deny: `junior-team: ${path} is already in your context, unchanged since you read it. To see a part again, read a slice with offset and limit.` }
+    }
+    const whole = async () => {
+      const out = await go()
+      if (print !== undefined && out.deny === undefined && out.isError !== true) await remember($, agentId, path, print).catch(() => undefined)
+      return out
+    }
+    // Parallel reads arrive together: the check and the sum sit inside the same update.
+    // A file that cannot be measured passes without counting.
+    const overBudget = async (): Promise<{ deny: string } | undefined> => {
+      const size = (await $.fs.stat(at.real).catch(() => undefined))?.size
+      if (size === undefined) return undefined
+      let used = 0
+      await track($, agentId, known => {
+        if (known === undefined) return undefined
+        used = known.stepChars ?? 0
+        return used + size > STEP_READ_CHARS ? known : { ...known, stepChars: used + size }
+      })
+      if (used + size <= STEP_READ_CHARS) return undefined
+      const map = size > STEP_READ_CHARS ? await resolve($, agentId, path, false).catch(() => '') : ''
+      return {
+        deny:
+          `junior-team: ${path} is ${size} characters; with the whole reads already in this step it passes ${STEP_READ_CHARS}, ` +
+          'and the context would grow past the compaction point in a single step. ' +
+          'Read fewer files per step, read a slice with offset and limit, or ask lookup for the symbol ("path#symbol").' +
+          (map === '' ? '' : `\n\nFile map:\n${map.slice(0, MAP_MAX)}`),
+      }
+    }
     const unit = (await read($, units)).find(one => one.id === row.unit)
-    if (unit !== undefined && isInside(normalize(at.view, await projectRoot($)), unit.paths)) return go()
+    if (unit !== undefined && isInside(path, unit.paths)) return (await overBudget()) ?? whole()
     if (row.reads >= WHOLE_READS_MAX) {
       // The refusal already carries the file map: the junior picks the symbol without one more call.
       const map = await resolve($, e.agentId, e.file_path, false).catch(() => '')
@@ -924,9 +1021,11 @@ export const register: Register = on => {
           (map === '' ? '' : `\n\nFile map:\n${map.slice(0, MAP_MAX)}`),
       }
     }
+    const refused = await overBudget()
+    if (refused !== undefined) return refused
     await track($, e.agentId, known => (known === undefined ? undefined : { ...known, reads: known.reads + 1 }))
 
-    return go()
+    return whole()
   }).catch(($, e, next) => next(e))
 
   // The scope applies to Edit and Write. Juniors have no Bash.
@@ -985,7 +1084,6 @@ export const register: Register = on => {
           ? undefined
           : { ...known, tests: 0, failing: undefined, gaining: false, done: false, from: known.toolCalls, writesFrom: known.writes ?? 0, nudged: 0 },
       )
-      if (typeof e.message === 'string' && e.message.trim() !== '') resumes.push({ to, message: e.message })
     }
 
     return next(e)
@@ -998,13 +1096,12 @@ export const register: Register = on => {
     // Handing back the report does not count: a junior at the cap must be able to report.
     if (row?.role !== 'junior') return next(e)
     if ((e.tool as string) === HANDBACK) {
-      // On hand-back the worktree returns to the main folder and disappears: later corrections happen there.
+      // On hand-back the unit's files return to the main folder, before the lead reads the report.
+      // The worktree is the junior's working folder: the engine refuses a call whose folder has gone,
+      // so it is removed at the end of the run, in turn.complete.
       const dir = (await read($, isolates))[row.unit]
       const unit = (await read($, units)).find(one => one.id === row.unit)
-      if (dir !== undefined && unit !== undefined) {
-        await closeWorktree($, await projectRoot($), dir, unit.paths)
-        await update($, isolates, all => Object.fromEntries(Object.entries(all ?? {}).filter(([id]) => id !== row.unit)))
-      }
+      if (dir !== undefined && unit !== undefined) await syncWorktree($, await projectRoot($), dir, unit.paths)
 
       return next(e)
     }
@@ -1055,6 +1152,11 @@ export const register: Register = on => {
   // The context of the main thread's last response: `plan` compares it with CONTEXT_HEAVY.
   // turn.step streams in pieces: the hook forwards all of them and reads the usage from the result.
   on('turn.step', async function* ($, e, next) {
+    // A junior's tool calls run between its steps, some while the step streams: the whole-read budget restarts as a step begins.
+    const agentId = e.agentId
+    if (agentId !== undefined) {
+      await track($, agentId, row => (row === undefined || !row.stepChars ? row : { ...row, stepChars: 0 })).catch(() => undefined)
+    }
     const step = yield* next(e)
     const usage = step.usage
     if (usage !== null && (e as { agentId?: string }).agentId === undefined) {
@@ -1074,9 +1176,18 @@ export const register: Register = on => {
       await setHeavy($, false).catch(() => undefined)
       await update($, context, () => out.tokensAfter ?? 0).catch(() => undefined)
     }
+    // A compacted agent no longer holds the files it read: they can be read whole again.
+    const agentId = e.agentId
+    if (agentId !== undefined && e.trigger !== 'precompute' && out.skip === undefined) {
+      await update($, wholeReads, all => Object.fromEntries(Object.entries(all ?? {}).filter(([id]) => id !== agentId))).catch(() => undefined)
+      // The count of whole files outside the unit starts over too.
+      await track($, agentId, row => (row === undefined ? undefined : { ...row, reads: 0 })).catch(() => undefined)
+    }
 
     return out
-  }).catch(($, e, next) => (next.called ? { skip: 'junior-team: error after compaction' } : next(e)))
+    // The hook's own work after next is guarded, so a failure here comes from next: the engine's compaction.
+    // next.error does not say where it came from; next is replay-safe, so its own result or error passes as it is.
+  }).catch(($, e, next) => next(e))
 
   // The activation rule goes into the system prompt of whoever can launch agents: juniors do not receive it.
   on('prompt.compose', async ($, e, next) => {
@@ -1098,6 +1209,7 @@ export const register: Register = on => {
     // A subagent closes only one turn: at the end of the turn it has come back, and the panel and the band take it off the work.
     if (e.agentId !== undefined) {
       await track($, e.agentId, row => (row === undefined ? undefined : { ...row, done: true })).catch(() => undefined)
+      await closeOnEnd($, e.agentId).catch(() => undefined)
     }
 
     return next(e)

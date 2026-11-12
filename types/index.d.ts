@@ -53,6 +53,8 @@ export type AgentRow = {
   failing?: number
   gaining?: boolean
   reads: number
+  // Characters of the whole reads admitted in the junior's current model step: turn.step sets it back to zero.
+  stepChars?: number
   // Tool calls of the run: the mod enforces the limit, because maxTurns does not stop a plugin agent.
   toolCalls: number
   // Nudges to write data already: one per IDLE_CALLS threshold.
@@ -90,6 +92,8 @@ declare module 'claude-code' {
       // True since `plan` found the context over the threshold, until a compaction or a lighter response brings it back below.
       heavy: boolean
       isolates: Record<string, string>
+      // Per junior, the files read whole (project path) with their fingerprint at that read: an unchanged second read is refused.
+      wholeReads: { [agentId: string]: { [path: string]: string } }
     }
   }
 }

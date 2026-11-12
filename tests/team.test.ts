@@ -729,17 +729,111 @@ test("a correction from the lead gives the tests back to the junior", async ($, 
   expect(again.result).toContain('FAILED')
 })
 
-test('a SendMessage resumes a stopped junior without the contract check', async ($, on) => {
+test('a resumed junior starts without the contract check', async ($, on) => {
   world(on)
-  on('tool.call', { tool: 'SendMessage' }, () => ({ result: 'sent' }))
   await $.tool.call({ tool: TOOL, action: 'plan', units: UNITS })
   await $.agent.spawn(junior('UNIT: lexer'))
-  await $.tool.call({ tool: 'SendMessage', to: 'agente-1', message: 'The files are in the worktree: fix the path.' })
-  const resumed = await $.agent.spawn(junior('The files are in the worktree: fix the path.'))
+  // The engine marks the resume with `resume`: the prompt is the lead's message, with no UNIT line.
+  const resumed = await $.agent.spawn({ ...junior('The files are in the worktree: fix the path.'), resume: { agentId: 'agente-1' } })
   expect(resumed.deny).toBeUndefined()
-  const stranger = await $.agent.spawn(junior('A task without a unit'))
+  // The same text without `resume` is a new launch: it needs a contract.
+  const stranger = await $.agent.spawn(junior('The files are in the worktree: fix the path.'))
   expect(stranger.deny).toContain('UNIT: <id>')
 })
+
+test('a second whole read of an unchanged file is refused, and does not count as a whole read', async ($, on) => {
+  world(on)
+  on('tool.call', { tool: 'Read' }, () => ({ result: 'content' }))
+  await $.tool.call({ tool: TOOL, action: 'plan', units: UNITS })
+  await $.agent.spawn(junior('UNIT: lexer'))
+  const file = 'src/core/Core.php'
+  expect((await $.tool.call({ tool: 'Read', agentId: 'agente-1', file_path: file })).deny).toBeUndefined()
+  for (let at = 0; at < 8; at += 1) {
+    const again = await $.tool.call({ tool: 'Read', agentId: 'agente-1', file_path: file })
+    expect(again.deny).toContain('already in your context')
+  }
+  const slice = await $.tool.call({ tool: 'Read', agentId: 'agente-1', file_path: file, offset: 10, limit: 20 })
+  expect(slice.deny).toBeUndefined()
+  // The refused reads used up none of the eight whole reads outside the unit.
+  for (let at = 1; at < 8; at += 1) {
+    const other = await $.tool.call({ tool: 'Read', agentId: 'agente-1', file_path: `app/Models/M${at}.php` })
+    expect(other.deny).toBeUndefined()
+  }
+  // Another junior has its own context.
+  await $.agent.spawn(junior('UNIT: core'))
+  expect((await $.tool.call({ tool: 'Read', agentId: 'agente-2', file_path: file })).deny).toBeUndefined()
+})
+
+test('a whole read passes again after a write of the junior, a change on disk or a compaction', async ($, on) => {
+  const seen = world(on)
+  on('tool.call', { tool: 'Read' }, () => ({ result: 'content' }))
+  on('tool.call', { tool: 'Edit' }, () => ({ result: 'edited' }))
+  const summary = [{ role: 'user' as const, text: 'summary', toolUses: [] }]
+  on('session.compact', () => ({ messages: summary }))
+  await $.tool.call({ tool: TOOL, action: 'plan', units: UNITS })
+  await $.agent.spawn(junior('UNIT: lexer'))
+  const file = 'src/lexer/Lexer.php'
+  const whole = () => $.tool.call({ tool: 'Read', agentId: 'agente-1', file_path: file })
+  await whole()
+  expect((await whole()).deny).toContain('already in your context')
+
+  // The mock fingerprint does not change on an Edit: the write alone reopens the read.
+  await $.tool.call({ tool: 'Edit', agentId: 'agente-1', file_path: file, old_string: 'a', new_string: 'b' })
+  expect((await whole()).deny).toBeUndefined()
+  expect((await whole()).deny).toContain('already in your context')
+
+  seen.writes += 1
+  expect((await whole()).deny).toBeUndefined()
+  expect((await whole()).deny).toContain('already in your context')
+
+  // The lead's compaction leaves the junior's context as it is.
+  await $.session.compact({ trigger: 'auto', messages: summary })
+  expect((await whole()).deny).toContain('already in your context')
+  await $.session.compact({ trigger: 'auto', agentId: 'agente-1', messages: summary })
+  expect((await whole()).deny).toBeUndefined()
+})
+
+test('whole reads in one step stop at the budget and pass again at the next step', async ($, on) => {
+  world(on)
+  on('tool.call', { tool: 'Read' }, () => ({ result: 'content' }))
+  on('fs.stat', ($, e) => ({ value: { kind: 'file' as const, size: e.path.endsWith('Big.php') ? 50_000 : 15_000, mtimeMs: 0, isLink: false } }))
+  on('turn.step', async function* ($, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: null }
+  })
+  await $.tool.call({ tool: TOOL, action: 'plan', units: UNITS })
+  await $.agent.spawn(junior('UNIT: lexer'))
+  let index = 0
+  const step = async () => {
+    for await (const _ of $.turn.step({ turnId: 't1', index: index++, model: 'haiku', messageCount: 1, agentId: 'agente-1' })) void _
+  }
+  const whole = (file: string) => $.tool.call({ tool: 'Read', agentId: 'agente-1', file_path: file })
+  await step()
+  // Three parallel reads of 15K characters: two fit in 40K, the third does not.
+  const three = await Promise.all(['A', 'B', 'C'].map(name => whole(`app/${name}.php`)))
+  expect(three.filter(out => out.deny === undefined).length).toBe(2)
+  const refused = three.find(out => out.deny !== undefined)
+  expect(refused?.deny).toContain('fewer files per step')
+  expect(refused?.deny).not.toContain('File map')
+  expect((await $.tool.call({ tool: 'Read', agentId: 'agente-1', file_path: 'app/C.php', offset: 1, limit: 50 })).deny).toBeUndefined()
+  await step()
+  expect((await whole('app/C.php')).deny).toBeUndefined()
+  // A file over the budget alone gets the map.
+  await step()
+  const big = await whole('app/Big.php')
+  expect(big.deny).toContain('File map')
+})
+
+for (const [given, expected] of [[undefined, 'medium'], ['low', 'low']] as const) {
+  test(`the juniorEffort option ${given ?? 'left out'} registers the junior with ${expected}`, { options: given === undefined ? {} : { juniorEffort: given } }, async ($, on) => {
+    const efforts: Record<string, unknown> = {}
+    on('session.start', () => ({ cwd: '/progetto' }))
+    on('agent.register', ($, e) => ((efforts[e.name] = e.effort), { value: { agent: `junior-team:${e.name}` } }))
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('tool.register', ($, e) => ({ value: { tool: e.name } }))
+    await $.session.start({ cwd: '/progetto', surface: null, isInteractive: false })
+    expect(efforts).toEqual({ junior: expected, reviewer: 'medium' })
+  })
+}
 
 test("a junior that reads without writing gets the invitation to write", async ($, on) => {
   world(on)
@@ -946,6 +1040,7 @@ test("an isolated unit works and tests in its worktree and on hand-back returns 
   const seen = world(on)
   const writes: string[] = []
   on('tool.call', { tool: 'Write' }, ($, e) => (writes.push(e.file_path), { result: 'written' }))
+  on('turn.complete', () => ({ text: '' }))
   const units = [{ ...UNITS[0], isolated: true, light: true }, UNITS[1]]
   await $.tool.call({ tool: TOOL, action: 'plan', units })
   await $.agent.spawn(junior('UNIT: lexer'))
@@ -964,11 +1059,70 @@ test("an isolated unit works and tests in its worktree and on hand-back returns 
   await $.tool.call({ tool: TRIAL, agentId: 'agente-1' })
   expect(seen.testCwds.at(-1)).toBe(dir)
 
+  // The hand-back copies the unit's files to the main folder and leaves the worktree, the junior's working folder.
+  const removed = (args: string[]) => args.length === 2 && args[0] === '/progetto' && args[1] === dir
   const before = seen.scripts.length
   await $.tool.call({ tool: 'SubagentHandback', agentId: 'agente-1', message: 'done' } as never)
   const after = seen.scripts.slice(before)
   expect(after.some(args => args.includes('src/lexer'))).toBe(true)
-  expect(after.length).toBeGreaterThanOrEqual(2)
+  expect(after.some(removed)).toBe(false)
+  const still = await $.tool.call({ tool: 'Write', agentId: 'agente-1', file_path: '/progetto/src/lexer/Lexer.php', content: 'x' })
+  expect(still.deny).toBeUndefined()
+  expect(writes.at(-1)).toBe(`${dir}/src/lexer/Lexer.php`)
+
+  // The end of the run removes it.
+  await $.turn.complete({ agentId: 'agente-1', answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(seen.scripts.slice(before).some(removed)).toBe(true)
+})
+
+test('a resumed isolated junior gets its worktree back and its edits there pass', async ($, on) => {
+  const seen = world(on)
+  const edits: string[] = []
+  on('tool.call', { tool: 'Edit' }, ($, e) => (edits.push(e.file_path), { result: 'edited' }))
+  on('turn.complete', () => ({ text: '' }))
+  await $.tool.call({ tool: TOOL, action: 'plan', units: [{ ...UNITS[0], isolated: true, light: true }, UNITS[1]] })
+  await $.agent.spawn(junior('UNIT: lexer'))
+  await $.turn.complete({ agentId: 'agente-1', answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  const dir = '/progetto/.git/junior-team-wt/lexer'
+  const inWorktree = `${dir}/src/lexer/Lexer.php`
+  const before = seen.scripts.length
+  const resumed = await $.agent.spawn({ ...junior('fix the empty branch'), resume: { agentId: 'agente-1' } })
+  expect(resumed.deny).toBeUndefined()
+  // The worktree opens again at the same path.
+  expect(seen.scripts.slice(before).some(args => args[0] === '/progetto' && args[1] === dir)).toBe(true)
+  const edit = await $.tool.call({ tool: 'Edit', agentId: 'agente-1', file_path: inWorktree, old_string: 'a', new_string: 'b' })
+  expect(edit.deny).toBeUndefined()
+  expect(edits.at(-1)).toBe(inWorktree)
+})
+
+test('an isolated junior that ends without hand-back does not leave its worktree open', async ($, on) => {
+  const seen = world(on)
+  const writes: string[] = []
+  on('tool.call', { tool: 'Write' }, ($, e) => (writes.push(e.file_path), { result: 'written' }))
+  on('turn.complete', () => ({ text: '' }))
+  const units = [{ ...UNITS[0], isolated: true, light: true }, UNITS[1]]
+  await $.tool.call({ tool: TOOL, action: 'plan', units })
+  await $.agent.spawn(junior('UNIT: lexer'))
+  const dir = '/progetto/.git/junior-team-wt/lexer'
+  const file = '/progetto/src/lexer/Lexer.php'
+  // The test's `$` has no `state`: the entry in `isolates` shows in where a junior's write lands.
+  await $.tool.call({ tool: 'Write', agentId: 'agente-1', file_path: file, content: 'x' })
+  expect(writes.at(-1)).toBe(`${dir}/src/lexer/Lexer.php`)
+
+  // The run ends at the turn cap: no SubagentHandback.
+  const end = { agentId: 'agente-1', answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'error' as const }
+  const before = seen.scripts.length
+  await $.turn.complete(end)
+  await $.tool.call({ tool: 'Write', agentId: 'agente-1', file_path: file, content: 'x' })
+  expect(writes.at(-1)).toBe(file)
+  const closed = seen.scripts.slice(before)
+  expect(closed.some(args => args.includes('src/lexer'))).toBe(true)
+  expect(closed.some(args => args[0] === '/progetto' && args[1] === dir)).toBe(true)
+
+  // A second end of the same worktree, as after a hand-back, closes nothing.
+  const again = seen.scripts.length
+  await $.turn.complete({ ...end, turnId: 't2' })
+  expect(seen.scripts.length).toBe(again)
 })
 
 test('light requires a test and isolated is boolean', async ($, on) => {

@@ -24,6 +24,12 @@ claude plugin install junior-team@junior-team
 - The `codegraph` CLI, used to build and update the project index. `plan` creates the index in `.codegraph/` if it is missing; the first run on a large project takes a few minutes.
 - `git`, for `isolated` units, which work in their own worktree.
 
+## Options
+
+- `juniorEffort`: the effort of the junior agents, `low`, `medium` or `high`. The default is `medium`, Haiku's own default, pinned so a change of defaults does not change the juniors.
+
+About 70% of a junior's output is thinking, and output is close to half of its context growth. `low` cuts thinking tokens, but it can lower the share of units whose first test run passes. The option exists to compare the two on real runs. Set it in the plugin's config menu, or under `pluginConfigs` in settings.
+
 ## Plan fields
 
 The architect declares the plan with `action: "plan"` on the `team` tool:
