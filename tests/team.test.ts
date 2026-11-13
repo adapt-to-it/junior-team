@@ -823,6 +823,39 @@ test('whole reads in one step stop at the budget and pass again at the next step
   expect(big.deny).toContain('File map')
 })
 
+test('a whole read passes again when the messages or the prompt of the junior drop between two steps', async ($, on) => {
+  world(on)
+  on('tool.call', { tool: 'Read' }, () => ({ result: 'content' }))
+  let prompt = 80_000
+  on('turn.step', async function* ($, e) {
+    const usage = { input_tokens: prompt, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 }
+
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: usage as never }
+  })
+  await $.tool.call({ tool: TOOL, action: 'plan', units: UNITS })
+  await $.agent.spawn(junior('UNIT: lexer'))
+  let index = 0
+  const step = async (messageCount: number) => {
+    for await (const _ of $.turn.step({ turnId: 't1', index: index++, model: 'haiku', messageCount, agentId: 'agente-1' })) void _
+  }
+  const whole = () => $.tool.call({ tool: 'Read', agentId: 'agente-1', file_path: 'src/lexer/Lexer.php' })
+  await step(10)
+  await whole()
+  // A history that grows leaves the record as it is.
+  prompt = 90_000
+  await step(12)
+  expect((await whole()).deny).toContain('already in your context')
+  // Another plugin shortened the tool results: as many messages, a much smaller prompt.
+  prompt = 20_000
+  await step(14)
+  expect((await whole()).deny).toBeUndefined()
+  expect((await whole()).deny).toContain('already in your context')
+  // The history was summarized without this hook seeing it: fewer messages, known before the step answers.
+  prompt = 21_000
+  await step(3)
+  expect((await whole()).deny).toBeUndefined()
+})
+
 for (const [given, expected] of [[undefined, 'medium'], ['low', 'low']] as const) {
   test(`the juniorEffort option ${given ?? 'left out'} registers the junior with ${expected}`, { options: given === undefined ? {} : { juniorEffort: given } }, async ($, on) => {
     const efforts: Record<string, unknown> = {}

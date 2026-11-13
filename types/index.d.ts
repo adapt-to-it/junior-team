@@ -55,6 +55,9 @@ export type AgentRow = {
   reads: number
   // Characters of the whole reads admitted in the junior's current model step: turn.step sets it back to zero.
   stepChars?: number
+  // Messages and prompt tokens of the junior's last model step: a drop means its history was compacted.
+  stepMessages?: number
+  stepPrompt?: number
   // Tool calls of the run: the mod enforces the limit, because maxTurns does not stop a plugin agent.
   toolCalls: number
   // Nudges to write data already: one per IDLE_CALLS threshold.

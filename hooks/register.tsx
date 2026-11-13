@@ -60,6 +60,9 @@ const JUNIOR_COMPACT_WINDOW = 100_000
 // at most 100K - 80K = 20K tokens. A Read result measured on real runs is about 2.2 characters per token:
 // 20K x 2.2 = 44K characters, rounded down for the line numbers Read adds.
 const STEP_READ_CHARS = 40_000
+// A prompt this much smaller than the junior's last one was compacted, whoever did it:
+// another plugin's session.compact hook can answer before this one is reached.
+const PROMPT_CUT = 0.75
 // Beyond this, the junior reports the failure instead of retrying.
 const TRIALS_MAX = 3
 // Beyond TRIALS_MAX a test run starts only if the last one reduced the failing tests, up to this cap.
@@ -201,6 +204,13 @@ const track = ($: Engine, id: string, edit: (row: AgentRow | undefined) => Agent
 
     return row === undefined ? (all ?? {}) : { ...all, [id]: row }
   })
+
+// A compacted agent no longer holds the files it read: they can be read whole again,
+// and the count of whole files outside the unit starts over.
+const forgetReads = async ($: Engine, agentId: string): Promise<void> => {
+  await update($, wholeReads, all => Object.fromEntries(Object.entries(all ?? {}).filter(([id]) => id !== agentId))).catch(() => undefined)
+  await track($, agentId, row => (row === undefined ? undefined : { ...row, reads: 0 })).catch(() => undefined)
+}
 
 // The reason a write is refused, or undefined when the write passes.
 // The path an isolated junior really touches: the project's, moved into its worktree.
@@ -1155,12 +1165,31 @@ export const register: Register = (on, options) => {
     // A junior's tool calls run between its steps, some while the step streams: the whole-read budget restarts as a step begins.
     const agentId = e.agentId
     if (agentId !== undefined) {
-      await track($, agentId, row => (row === undefined || !row.stepChars ? row : { ...row, stepChars: 0 })).catch(() => undefined)
+      // Fewer messages than at its last step: the history was summarized. Known before the step, so its reads pass.
+      let cut = false
+      await track($, agentId, row => {
+        if (row === undefined) return row
+        cut = row.stepMessages !== undefined && e.messageCount < row.stepMessages
+
+        return { ...row, stepChars: 0, stepMessages: e.messageCount }
+      }).catch(() => undefined)
+      if (cut) await forgetReads($, agentId)
     }
     const step = yield* next(e)
     const usage = step.usage
-    if (usage !== null && (e as { agentId?: string }).agentId === undefined) {
-      const size = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    const size = usage === null ? 0 : usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    if (agentId !== undefined && size > 0) {
+      // A compaction that only shortens tool results keeps every message: the prompt size shows it, once the step answers.
+      let cut = false
+      await track($, agentId, row => {
+        if (row === undefined) return row
+        cut = row.stepPrompt !== undefined && size < row.stepPrompt * PROMPT_CUT
+
+        return { ...row, stepPrompt: size }
+      }).catch(() => undefined)
+      if (cut) await forgetReads($, agentId)
+    }
+    if (usage !== null && agentId === undefined) {
       await update($, context, () => size).catch(() => undefined)
       // The notice stays while the context is heavy: below the threshold it is removed.
       if (size <= CONTEXT_HEAVY) await setHeavy($, false).catch(() => undefined)
@@ -1176,13 +1205,8 @@ export const register: Register = (on, options) => {
       await setHeavy($, false).catch(() => undefined)
       await update($, context, () => out.tokensAfter ?? 0).catch(() => undefined)
     }
-    // A compacted agent no longer holds the files it read: they can be read whole again.
     const agentId = e.agentId
-    if (agentId !== undefined && e.trigger !== 'precompute' && out.skip === undefined) {
-      await update($, wholeReads, all => Object.fromEntries(Object.entries(all ?? {}).filter(([id]) => id !== agentId))).catch(() => undefined)
-      // The count of whole files outside the unit starts over too.
-      await track($, agentId, row => (row === undefined ? undefined : { ...row, reads: 0 })).catch(() => undefined)
-    }
+    if (agentId !== undefined && e.trigger !== 'precompute' && out.skip === undefined) await forgetReads($, agentId)
 
     return out
     // The hook's own work after next is guarded, so a failure here comes from next: the engine's compaction.
