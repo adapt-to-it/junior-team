@@ -163,11 +163,53 @@ const release = async ($: Engine, unitId: string): Promise<void> => {
   if (dir !== undefined) await closeWorktree($, await projectRoot($), dir, unit.paths)
 }
 
+// What the lead wrote to each junior, word for word: the contract, then the corrections sent with SendMessage.
+const briefs = atom({ plugin: 'junior-team', key: 'briefs' } as const, {} as Record<string, string[]>)
+
+const brief = ($: Engine, agentId: string, text: string): Promise<unknown> =>
+  update($, briefs, all => {
+    const own = all?.[agentId] ?? []
+
+    return own.includes(text) ? (all ?? {}) : { ...all, [agentId]: [...own, text] }
+  }).catch(() => undefined)
+
+const BRIEF_MARK = "junior-team: the lead's messages to you, word for word."
+
+// The summary of a compaction paraphrases the contract: the lead's own words go back to the junior with its next tool result.
+// They do not go into the compaction's messages: a message added there makes the engine reload the whole history
+// when the junior is resumed (measured live: a first step of 175K tokens instead of 52K).
+const briefText = (said: readonly string[]): string =>
+  [
+    `${BRIEF_MARK} Your context was compacted: where the summary differs from them, these hold.`,
+    ...said.map((one, at) => `--- ${at === 0 ? 'contract' : `message ${at + 1}`} ---\n${one}`),
+  ].join('\n\n')
+
+// The mod's state does not outlive a restart of the session, a junior's transcript does: a resumed junior with no row
+// gets it back from the "UNIT: <id>" line of its contract. Returns the row, or the reason the resume is refused.
+const rebuild = async ($: Engine, agentId: string): Promise<AgentRow | string> => {
+  const found = await $.session.messages({ agentId })
+  const contract = 'deny' in found ? undefined : found.find(message => message.role === 'user' && unitOf(message.text) !== undefined)?.text
+  const unit = contract === undefined ? undefined : (await read($, units)).find(one => one.id === unitOf(contract))
+  if (contract === undefined || unit === undefined) {
+    return (
+      'junior-team: this junior is no longer registered: the session restarted and the plan was lost, or the plan no longer has its unit. ' +
+      'Declare the plan again with mcp__junior-team__team, action plan, then send the message again or launch a new junior for the unit.'
+    )
+  }
+  const row = { ...emptyRow(unit.id, 'junior', unit.model), contract: contract.length }
+  await track($, agentId, () => row)
+  await brief($, agentId, contract)
+
+  return row
+}
+
 // A resumed isolated junior still works in its worktree's folder, removed at the end of its last run:
 // the worktree opens again at the same path from the current state, before the run starts.
 // Returns the reason the resume is refused, or undefined.
-const reopen = async ($: Engine, agentId: string): Promise<string | undefined> => {
-  const row = (await read($, agents))[agentId]
+const reopen = async ($: Engine, agentId: string, isJunior: boolean): Promise<string | undefined> => {
+  const known = (await read($, agents))[agentId]
+  const row = known === undefined && isJunior ? await rebuild($, agentId) : known
+  if (typeof row === 'string') return row
   if (row?.role !== 'junior') return undefined
   const unit = (await read($, units)).find(one => one.id === row.unit)
   if (unit?.isolated !== true || (await read($, isolates))[unit.id] !== undefined) return undefined
@@ -206,10 +248,11 @@ const track = ($: Engine, id: string, edit: (row: AgentRow | undefined) => Agent
   })
 
 // A compacted agent no longer holds the files it read: they can be read whole again,
-// and the count of whole files outside the unit starts over.
+// and the count of whole files outside the unit starts over. It is also owed the lead's words, once:
+// the prompt size starts over with it, so the same compaction is not seen a second time at the end of the step.
 const forgetReads = async ($: Engine, agentId: string): Promise<void> => {
   await update($, wholeReads, all => Object.fromEntries(Object.entries(all ?? {}).filter(([id]) => id !== agentId))).catch(() => undefined)
-  await track($, agentId, row => (row === undefined ? undefined : { ...row, reads: 0 })).catch(() => undefined)
+  await track($, agentId, row => (row === undefined ? undefined : { ...row, reads: 0, stepPrompt: 0, briefDue: true })).catch(() => undefined)
 }
 
 // The reason a write is refused, or undefined when the write passes.
@@ -897,8 +940,12 @@ export const register: Register = (on, options) => {
     // A SendMessage to a finished agent resumes it under the same id: the prompt is the message, not a contract,
     // and the launch checks do not apply. The check comes first, so it does not depend on the resumed run's type.
     if (e.resume !== undefined) {
-      const why = await reopen($, e.resume.agentId)
-      return why === undefined ? next(e) : { deny: why }
+      const why = await reopen($, e.resume.agentId, e.subagentType === JUNIOR)
+      if (why !== undefined) return { deny: why }
+      // The message of a resume is the lead's correction: it outlives the junior's compactions with the contract.
+      if ((await read($, agents))[e.resume.agentId]?.role === 'junior') await brief($, e.resume.agentId, e.prompt)
+
+      return next(e)
     }
     if (e.subagentType !== JUNIOR && e.subagentType !== REVIEWER) return next(e)
 
@@ -968,6 +1015,7 @@ export const register: Register = (on, options) => {
     const agentId = started.agentId
     if (agentId !== undefined) {
       await track($, agentId, () => ({ ...emptyRow(unit.id, 'junior', started.model), contract: e.prompt.length }))
+      await brief($, agentId, e.prompt)
       await mark($, unit.id, false)
     }
 
@@ -1127,28 +1175,37 @@ export const register: Register = (on, options) => {
     // The check sits inside the update: parallel calls do not get the same nudge.
     let idle = false
     let calls = 0
+    // After a compaction the first call that passes carries the lead's words: parallel calls do not carry them twice.
+    let owed = false
     await track($, e.agentId, known => {
       if (known === undefined) return undefined
       const nudged = known.nudged ?? 0
       const threshold = IDLE_CALLS[nudged]
       calls = known.toolCalls + 1
       idle = known.code === 0 && threshold !== undefined && calls >= threshold && e.tool !== 'Write' && e.tool !== 'Edit'
+      owed = known.briefDue === true
 
       return {
         ...known,
         toolCalls: calls,
         writes: (known.writes ?? 0) + (isWork(e.tool as string) ? 1 : 0),
         nudged: idle ? nudged + 1 : known.nudged,
+        briefDue: false,
       }
     })
-
-    return withNotice(
-      await next(e),
+    const out = await next(e)
+    const said = owed ? ((await read($, briefs).catch(() => undefined))?.[e.agentId] ?? []) : []
+    // A refused call carries no notice: the words stay owed to the next one.
+    if (owed && out.deny !== undefined) await track($, e.agentId, known => (known === undefined ? undefined : { ...known, briefDue: true })).catch(() => undefined)
+    const notices = [
       idle
         ? `junior-team: you made ${calls} calls without writing a file. Stop exploring: write the unit's files now with what you know, ` +
-            'then report in your summary the doubts and what you could not verify.'
+          'then report in your summary the doubts and what you could not verify.'
         : undefined,
-    )
+      said.length > 0 ? briefText(said) : undefined,
+    ].filter(one => one !== undefined)
+
+    return withNotice(out, notices.length > 0 ? notices.join('\n\n') : undefined)
   }).catch(($, e, next) => (next.called ? { deny: 'junior-team: the call count failed.' } : next(e)))
 
   // Bash scripts of the main thread that write files: the mod estimates their code, it does not block them.

@@ -15,6 +15,7 @@ The contract is deliberately short. It names the files you write, the files to r
 
 Rules:
 - Your launch message starts with "UNIT: <id>": that names your unit.
+- When your context is compacted, the system adds to your next tool result a note that starts with "junior-team: the lead's messages to you": it is your contract and the lead's corrections, word for word. Follow it where the summary differs.
 - Write only in your unit's files, with Write and Edit. The system rejects any write outside those files: if you need another file, stop and report it.
 - You have no shell. To test your unit, call the test tool: it runs the test declared in the plan.
 - Read the files the contract cites and those of your unit. Do not explore the rest of the project: after 8 whole files outside your unit the system rejects whole-file reads.

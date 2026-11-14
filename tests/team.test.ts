@@ -856,6 +856,50 @@ test('a whole read passes again when the messages or the prompt of the junior dr
   expect((await whole()).deny).toBeUndefined()
 })
 
+test("the lead's contract and corrections come back word for word after a compaction of the junior", async ($, on) => {
+  world(on)
+  const summary = [{ role: 'user' as const, text: 'summary', toolUses: [] }]
+  on('tool.call', { tool: 'Grep' }, () => ({ result: 'nothing' }))
+  on('session.compact', ($, e) => ({ messages: e.messages }))
+  await $.tool.call({ tool: TOOL, action: 'plan', units: UNITS })
+  await $.agent.spawn(junior('UNIT: lexer\nTokens keep their column.'))
+  await $.agent.spawn({ ...junior('The empty branch returns null.'), resume: { agentId: 'agente-1' } })
+
+  const grep = () => $.tool.call({ tool: 'Grep', agentId: 'agente-1', pattern: 'x' })
+  expect((await grep()).context).toBeUndefined()
+
+  // The lead's own compaction owes the junior nothing.
+  await $.session.compact({ trigger: 'auto', messages: summary })
+  expect((await grep()).context).toBeUndefined()
+  // The junior's compaction keeps its messages as the engine made them: a message added there breaks the resume.
+  expect((await $.session.compact({ trigger: 'auto', agentId: 'agente-1', messages: summary })).messages).toEqual(summary)
+  const [first, second] = await Promise.all([grep(), grep()])
+  const carried = [first, second].flatMap(out => out.context ?? [])
+  expect(carried.length).toBe(1)
+  expect(carried[0]).toContain('UNIT: lexer\nTokens keep their column.')
+  expect(carried[0]).toContain('The empty branch returns null.')
+  expect((await grep()).context).toBeUndefined()
+})
+
+test('a resumed junior the mod no longer knows gets its unit back from its transcript', async ($, on) => {
+  world(on)
+  on('tool.call', { tool: 'Edit' }, () => ({ result: 'edited' }))
+  const contracts: Record<string, string> = { 'agente-7': 'UNIT: lexer\nTokens keep their column.', 'agente-8': 'UNIT: ghost\nNot in the plan.' }
+  on('session.messages', ($, e) => ({ value: [{ role: 'user' as const, text: contracts[(e as { agentId?: string }).agentId ?? ''] ?? '', toolUses: [] }] }))
+  await $.tool.call({ tool: TOOL, action: 'plan', units: UNITS })
+  const edit = (agentId: string, file: string) => $.tool.call({ tool: 'Edit', agentId, file_path: file, old_string: 'a', new_string: 'b' })
+
+  // The session restarted: the junior exists, its row does not.
+  const resumed = await $.agent.spawn({ ...junior('Fix the empty branch.'), resume: { agentId: 'agente-7' } })
+  expect(resumed.deny).toBeUndefined()
+  expect((await edit('agente-7', 'src/lexer/Lexer.php')).deny).toBeUndefined()
+  expect((await edit('agente-7', 'src/parser/Parser.php')).deny).toContain('outside the unit')
+
+  // A unit the plan does not have: the resume says why, before the junior runs.
+  const lost = await $.agent.spawn({ ...junior('Fix the empty branch.'), resume: { agentId: 'agente-8' } })
+  expect(lost.deny).toContain('no longer registered')
+})
+
 for (const [given, expected] of [[undefined, 'medium'], ['low', 'low']] as const) {
   test(`the juniorEffort option ${given ?? 'left out'} registers the junior with ${expected}`, { options: given === undefined ? {} : { juniorEffort: given } }, async ($, on) => {
     const efforts: Record<string, unknown> = {}

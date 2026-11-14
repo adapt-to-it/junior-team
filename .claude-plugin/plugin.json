@@ -1,6 +1,6 @@
 {
   "name": "junior-team",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Contract-based delegation: the lead model writes short contracts, low-cost junior agents write the code inside enforced file scopes, with automatic checks and token accounting.",
   "author": {
     "name": "Marco Abbattista"

@@ -58,6 +58,8 @@ export type AgentRow = {
   // Messages and prompt tokens of the junior's last model step: a drop means its history was compacted.
   stepMessages?: number
   stepPrompt?: number
+  // True from a compaction of the junior until a tool result has carried the lead's words back to it.
+  briefDue?: boolean
   // Tool calls of the run: the mod enforces the limit, because maxTurns does not stop a plugin agent.
   toolCalls: number
   // Nudges to write data already: one per IDLE_CALLS threshold.
@@ -97,6 +99,8 @@ declare module 'claude-code' {
       isolates: Record<string, string>
       // Per junior, the files read whole (project path) with their fingerprint at that read: an unchanged second read is refused.
       wholeReads: { [agentId: string]: { [path: string]: string } }
+      // Per junior, what the lead wrote to it, word for word: the contract, then the corrections. A compaction puts them back.
+      briefs: { [agentId: string]: string[] }
     }
   }
 }
